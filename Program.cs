@@ -27,9 +27,6 @@ const int TileSizeY = 22000;
 // Width of the image
 const int TileSizeX = 13000;
 
-// Number of bytes in memory that a single pixel (TileDB cell) occupies
-const int BytesPerPixel = sizeof(AttrType);
-
 // Whether the data is of 3 channel unsigned 8-bit integer pixel type
 const bool Rgb = false;
 
@@ -58,6 +55,7 @@ Console.WriteLine($"TileDB root: {TileDBRoot}");
 using Context ctx = new();
 
 CalculateResolutionZero();
+CalculatePyramid();
 
 static string FormatSubarray(Subarray s)
 {
@@ -96,7 +94,7 @@ string CreateArray(int resolution, int extentY, int extentX)
     schema.SetDomain(domain);
     schema.AddAttribute(a1);
 
-    string arrayUri = $"{TileDBRoot}/torture_{resolution}_{extentY}_{extentX}";
+    string arrayUri = $"{TileDBRoot}/torture_{resolution}";
     Console.WriteLine($"Creating array: {arrayUri}");
     TileDBArray.Create(ctx, arrayUri, schema);
     return arrayUri;
@@ -167,4 +165,94 @@ void CalculateResolutionZero()
         }
     }
     Consolidate(uri);
+}
+
+AttrType[] DownsampleTileSis(AttrType[] sourceBuffer, int sourceWidth, int sourceHeight)
+{
+    // In the Java code downsampling needed an external library.
+    // We will just create a dummy array.
+    return new AttrType[sourceWidth * sourceHeight];
+}
+
+void ProcessTile(TileDBArray source, TileDBArray destination, int resolution, int t, int c, int z, int y0, int x0)
+{
+    int factor = (int)Math.Pow(2, resolution);
+    int previousFactor = (int)Math.Pow(2, resolution - 1);
+    int sizeY = SizeY / factor;
+    int sizeX = SizeX / factor;
+    int sourceY0 = y0 * 2;
+    int sourceY1 = int.Min(sourceY0 + TileSizeY * 2, SizeY / previousFactor) - 1;
+    int sourceX0 = x0 * 2;
+    int sourceΧ1 = int.Min(sourceX0 + TileSizeX * 2, SizeX / previousFactor) - 1;
+    int sourceWidth = sourceΧ1 + 1 - sourceX0;
+    int sourceHeight = sourceY1 + 1 - sourceY0;
+    int y1 = int.Min(y0 + sourceHeight / 2, SizeY) - 1;
+    int x1 = int.Min(x0 + sourceWidth / 2, SizeX) - 1;
+
+    AttrType[] data = new AttrType[sourceHeight * sourceWidth];
+    using var sourceQuery = new Query(source, QueryType.Read);
+    using var destinationQuery = new Query(destination, QueryType.Write);
+    using var sourceSubarray = new Subarray(source);
+    using var destinationSubarray = new Subarray(destination);
+
+    sourceSubarray.AddRange(0, t, t);
+    sourceSubarray.AddRange(1, c, c);
+    sourceSubarray.AddRange(2, z, z);
+    sourceSubarray.AddRange(3, sourceY0, sourceY1);
+    sourceSubarray.AddRange(4, sourceX0, sourceΧ1);
+    sourceQuery.SetSubarray(sourceSubarray);
+    sourceQuery.SetDataBuffer("a1", data);
+    sourceQuery.Submit();
+    Console.WriteLine($"Read rectangle: {FormatSubarray(sourceSubarray)}; status: {sourceQuery.Status()}");
+
+    AttrType[] destinationData = DownsampleTileSis(data, sourceWidth, sourceHeight);
+
+    destinationSubarray.AddRange(0, t, t);
+    destinationSubarray.AddRange(1, c, c);
+    destinationSubarray.AddRange(2, z, z);
+    destinationSubarray.AddRange(3, sourceY0, sourceY1);
+    destinationSubarray.AddRange(4, sourceX0, sourceΧ1);
+    destinationQuery.SetSubarray(destinationSubarray);
+    destinationQuery.SetDataBuffer("a1", destinationData);
+    destinationQuery.Submit();
+    Console.WriteLine($"Read rectangle: {FormatSubarray(destinationSubarray)}; status: {destinationQuery.Status()}");
+}
+
+void CalculatePyramid()
+{
+    for (int resolution = 1; resolution < Resolutions; resolution++)
+    {
+        string uri = CreateArray(resolution, TileSizeY, TileSizeX);
+        for (int t = 0; t < SizeT; t++)
+        {
+            for (int c = 0; c < SizeC; c++)
+            {
+                for (int z = 0; z < SizeZ; z++)
+                {
+                    Console.WriteLine($"Calculate pyramid for Resolution:{resolution} T:{t} C:{c} Z:{z}");
+                    var sourceRoot = $"{TileDBRoot}/torture_{resolution - 1}";
+                    var destinationRoot = $"{TileDBRoot}/torture_{resolution}";
+
+                    using var source = new TileDBArray(ctx, sourceRoot);
+                    using var destination = new TileDBArray(ctx, destinationRoot);
+                    source.Open(QueryType.Read);
+                    destination.Open(QueryType.Write);
+                    List<Task> tasks = new();
+                    int gridSizeY = (int)double.Ceiling((double)SizeY / 2 / TileSizeY);
+                    int gridSizeX = (int)double.Ceiling((double)SizeX / 2 / TileSizeX);
+                    for (int y = 0; y < gridSizeY; y++)
+                    {
+                        for (int x = 0; x < gridSizeX; x++)
+                        {
+                            int tileY = y * TileSizeY;
+                            int tileX = x * TileSizeX;
+                            tasks.Add(Task.Run(() => ProcessTile(source, destination, resolution, t, c, z, tileY, tileX)));
+                        }
+                    }
+                    Task.WaitAll(tasks.ToArray());
+                }
+            }
+        }
+        Consolidate(uri);
+    }
 }
